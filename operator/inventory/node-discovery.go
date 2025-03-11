@@ -26,9 +26,15 @@ import (
 
 	v1 "github.com/akash-network/akash-api/go/inventory/v1"
 
+	"net"
+	"os"
+
 	"github.com/akash-network/provider/cluster/kube/builder"
 	ctypes "github.com/akash-network/provider/cluster/types/v1beta3"
 	"github.com/akash-network/provider/tools/fromctx"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
 
 var (
@@ -119,6 +125,40 @@ func (dp *nodeDiscovery) queryCPU(ctx context.Context) (*cpu.Info, error) {
 }
 
 func (dp *nodeDiscovery) queryGPU(ctx context.Context) (*gpu.Info, error) {
+	// Connect to NVIDIA device plugin socket
+	socketPath := "/var/lib/kubelet/device-plugins/nvidia-gpu.sock"
+	if _, err := os.Stat(socketPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("Socket not found at %s", socketPath)
+	}
+
+	conn, err := grpc.Dial(
+		socketPath,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
+			return net.DialTimeout("unix", addr, timeout)
+		}),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	client := pluginapi.NewDevicePluginClient(conn)
+	resp, err := client.ListAndWatch(ctx, &pluginapi.Empty{})
+	if err != nil {
+		return nil, fmt.Errorf("Failed to list devices: %v", err)
+	}
+
+	response, err := resp.Recv()
+	if err != nil {
+		return nil, fmt.Errorf("Error receiving device list: %v", err)
+	}
+
+	// Process GPU information
+	// (This is a placeholder for processing logic)
+	fmt.Printf("Total GPUs: %d\n", len(response.Devices))
+
+	// Existing channel-based logic
 	respch := make(chan dpReadResp, 1)
 
 	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -680,7 +720,7 @@ func updateNodeInfo(knode *corev1.Node, node *v1.Node) {
 		case corev1.ResourceMemory:
 			node.Resources.Memory.Quantity.Allocatable.Set(r.Value())
 		case corev1.ResourceEphemeralStorage:
-			node.Resources.EphemeralStorage.Allocatable.Set(r.Value())
+			node.Resources.EphemeralStorage.Allocated.Set(r.Value())
 		case builder.ResourceGPUNvidia:
 			fallthrough
 		case builder.ResourceGPUAMD:
@@ -918,49 +958,102 @@ func (dp *nodeDiscovery) parseGPUInfo(ctx context.Context, info RegistryGPUVendo
 
 	log := fromctx.LogrFromCtx(ctx).WithName("node.monitor")
 
+	// Retrieve existing GPU data
 	gpus, err := dp.queryGPU(ctx)
 	if err != nil {
-		log.Error(err, "unable to query gpu")
-		return res
+		log.Error(err, "unable to query existing gpu data")
 	}
 
-	if gpus == nil {
-		return res
+	// Retrieve GPU data from NVDP
+	devices, err := dp.checkNVDPGPUs(ctx)
+	if err != nil {
+		log.Error(err, "unable to query gpu from NVDP")
 	}
 
-	for _, dev := range gpus.GraphicsCards {
-		dinfo := dev.DeviceInfo
-		if dinfo == nil {
-			continue
-		}
+	// Create a map for quick lookup of NVDP GPUs by UUID
+	nvdpgpuMap := make(map[string]*pluginapi.Device)
+	for _, device := range devices {
+		nvdpgpuMap[device.ID] = device
+	}
 
-		vinfo := dinfo.Vendor
-		pinfo := dinfo.Product
-		if vinfo == nil || pinfo == nil {
-			continue
-		}
+	// Match and combine data using UUID
+	if gpus != nil {
+		for _, dev := range gpus.GraphicsCards {
+			dinfo := dev.DeviceInfo
+			if dinfo == nil {
+				continue
+			}
 
-		vendor, exists := info[vinfo.ID]
-		if !exists {
-			continue
-		}
+			vinfo := dinfo.Vendor
+			pinfo := dinfo.Product
+			if vinfo == nil || pinfo == nil {
+				continue
+			}
 
-		model, exists := vendor.Devices[pinfo.ID]
-		if !exists {
-			continue
-		}
+			vendor, exists := info[vinfo.ID]
+			if !exists {
+				continue
+			}
 
-		res = append(res, v1.GPUInfo{
-			Vendor:     vendor.Name,
-			VendorID:   dev.DeviceInfo.Vendor.ID,
-			Name:       model.Name,
-			ModelID:    dev.DeviceInfo.Product.ID,
-			Interface:  model.Interface,
-			MemorySize: model.MemorySize,
-		})
+			model, exists := vendor.Devices[pinfo.ID]
+			if !exists {
+				continue
+			}
+
+			// Check if the GPU is in the NVDP map
+			nvdpgpu, found := nvdpgpuMap[dev.DeviceInfo.Product.ID]
+			healthy := false
+			if found && nvdpgpu.Health == "Healthy" {
+				healthy = true
+			}
+
+			// Combine data
+			res = append(res, v1.GPUInfo{
+				Vendor:     vendor.Name,
+				VendorID:   dev.DeviceInfo.Vendor.ID,
+				Name:       model.Name,
+				ModelID:    dev.DeviceInfo.Product.ID,
+				Interface:  model.Interface,
+				MemorySize: model.MemorySize,
+				Healthy:    healthy,
+			})
+		}
 	}
 
 	sort.Sort(res)
 
 	return res
+}
+
+func (dp *nodeDiscovery) checkNVDPGPUs(ctx context.Context) ([]*pluginapi.Device, error) {
+	// Connect to NVIDIA device plugin socket
+	socketPath := "/var/lib/kubelet/device-plugins/nvidia-gpu.sock"
+	if _, err := os.Stat(socketPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("Socket not found at %s", socketPath)
+	}
+
+	conn, err := grpc.Dial(
+		socketPath,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
+			return net.DialTimeout("unix", addr, timeout)
+		}),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	client := pluginapi.NewDevicePluginClient(conn)
+	resp, err := client.ListAndWatch(ctx, &pluginapi.Empty{})
+	if err != nil {
+		return nil, fmt.Errorf("Failed to list devices: %v", err)
+	}
+
+	response, err := resp.Recv()
+	if err != nil {
+		return nil, fmt.Errorf("Error receiving device list: %v", err)
+	}
+
+	return response.Devices, nil
 }
